@@ -136,7 +136,6 @@ impl KvStore {
         self.writer.seek(SeekFrom::End(0))?;
         self.readers
             .insert(self.active_gen, BufReader::new(File::open(path)?));
-        self.compact(self.active_gen - 1)?;
         Ok(())
     }
 
@@ -144,6 +143,7 @@ impl KvStore {
         let len = self.writer.get_ref().metadata()?.len();
         if len >= MAX_FILE_SIZE {
             self.use_next_gen()?;
+            self.compact(self.active_gen - 1)?;
         }
         let pos = self.writer.stream_position()?;
         serde_json::to_writer(&mut self.writer, &cmd)?;
