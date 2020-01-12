@@ -1,11 +1,14 @@
 use crate::{KvsEngine, KvsError, Result};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
+use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
@@ -22,17 +25,30 @@ struct CommandPos {
     len: u64,
 }
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
+const MAX_FILE_SIZE: u64 = 1024 * 1024;
 const COMPACTION_THRESHOLD: u64 = (MAX_FILE_SIZE as f64 * 0.6) as u64;
 
 pub struct KvStore {
-    dir: PathBuf,
-    active_gen: u64,
+    dir: Arc<PathBuf>,
+    active_gen: Arc<Mutex<u64>>,
     // Reading order is important
-    readers: BTreeMap<u64, BufReader<File>>,
-    writer: BufWriter<File>,
-    keydir: HashMap<String, CommandPos>,
-    pub dead_bytes: HashMap<u64, u64>,
+    readers: RefCell<BTreeMap<u64, BufReader<File>>>,
+    writer: Arc<Mutex<BufWriter<File>>>,
+    keydir: Arc<SkipMap<String, CommandPos>>,
+    dead_bytes: Arc<Mutex<HashMap<u64, u64>>>,
+}
+
+impl Clone for KvStore {
+    fn clone(&self) -> KvStore {
+        KvStore {
+            dir: Arc::clone(&self.dir),
+            active_gen: Arc::clone(&self.active_gen),
+            readers: RefCell::new(BTreeMap::new()),
+            writer: Arc::clone(&self.writer),
+            keydir: Arc::clone(&self.keydir),
+            dead_bytes: Arc::clone(&self.dead_bytes),
+        }
+    }
 }
 
 fn get_log_path(dir: &PathBuf, gen: u64) -> PathBuf {
@@ -78,27 +94,28 @@ impl KvStore {
         let (keydir, dead_bytes) =
             Self::read_hints(&dir).or_else(|_| Self::replay_logs(&mut readers))?;
         Ok(KvStore {
-            dir,
-            readers,
-            active_gen,
-            writer,
-            keydir,
-            dead_bytes,
+            dir: Arc::new(dir),
+            readers: RefCell::new(readers),
+            active_gen: Arc::new(Mutex::new(active_gen)),
+            writer: Arc::new(Mutex::new(writer)),
+            keydir: Arc::new(keydir),
+            dead_bytes: Arc::new(Mutex::new(dead_bytes)),
         })
     }
 
-    fn read_hints(dir: &PathBuf) -> Result<(HashMap<String, CommandPos>, HashMap<u64, u64>)> {
-        let reader = BufReader::new(File::open(dir.join("keydir.hint"))?);
-        let keydir = serde_json::from_reader(reader)?;
-        let reader = BufReader::new(File::open(dir.join("dead_bytes.hint"))?);
-        let dead_bytes = serde_json::from_reader(reader)?;
-        Ok((keydir, dead_bytes))
+    fn read_hints(dir: &PathBuf) -> Result<(SkipMap<String, CommandPos>, HashMap<u64, u64>)> {
+        // let reader = BufReader::new(File::open(dir.join("keydir.hint"))?);
+        // let keydir = serde_json::from_reader(reader)?;
+        // let reader = BufReader::new(File::open(dir.join("dead_bytes.hint"))?);
+        // let dead_bytes = serde_json::from_reader(reader)?;
+        // Ok((keydir, dead_bytes))
+        Err(KvsError::KeyNotFound) // TODO: SkipMap is not serializable
     }
 
     fn replay_logs(
         readers: &mut BTreeMap<u64, BufReader<File>>,
-    ) -> Result<(HashMap<String, CommandPos>, HashMap<u64, u64>)> {
-        let mut keydir = HashMap::new();
+    ) -> Result<(SkipMap<String, CommandPos>, HashMap<u64, u64>)> {
+        let mut keydir = SkipMap::<String, CommandPos>::new();
         let mut dead_bytes = HashMap::new();
         for (&gen, reader) in readers.iter_mut() {
             let mut pos = 0;
@@ -108,13 +125,15 @@ impl KvStore {
                 let len = new_pos - pos;
                 match cmd? {
                     Command::Set { key, .. } => {
-                        let cmd_pos = CommandPos { gen, pos, len };
-                        if let Some(old) = keydir.insert(key, cmd_pos) {
-                            *dead_bytes.entry(old.gen).or_insert(0) += old.len;
+                        if let Some(old) = keydir.get(&key) {
+                            *dead_bytes.entry(old.value().gen).or_insert(0) += old.value().len;
                         }
+                        keydir.insert(key, CommandPos { gen, pos, len });
                     }
                     Command::Remove { key, .. } => match keydir.remove(&key) {
-                        Some(old) => *dead_bytes.entry(old.gen).or_insert(0) += old.len,
+                        Some(old) => {
+                            *dead_bytes.entry(old.value().gen).or_insert(0) += old.value().len
+                        }
                         None => *dead_bytes.entry(gen).or_insert(0) += len,
                     },
                 }
@@ -124,105 +143,99 @@ impl KvStore {
         Ok((keydir, dead_bytes))
     }
 
-    fn use_next_gen(&mut self) -> Result<()> {
-        self.active_gen += 1;
-        let path = get_log_path(&self.dir, self.active_gen);
-        self.writer = BufWriter::new(
+    fn use_next_gen(&self) -> Result<()> {
+        let active_gen = self.active_gen.lock().unwrap();
+        *active_gen += 1;
+        let path = get_log_path(&self.dir, *active_gen);
+        let writer = self.writer.lock().unwrap();
+        *writer = BufWriter::new(
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)?,
         );
-        self.writer.seek(SeekFrom::End(0))?;
-        self.readers
-            .insert(self.active_gen, BufReader::new(File::open(path)?));
         Ok(())
     }
 
-    fn write_command(&mut self, cmd: Command) -> Result<(u64, u64)> {
-        let len = self.writer.get_ref().metadata()?.len();
+    fn write_command(&self, cmd: Command) -> Result<(u64, u64)> {
+        let mut writer = self.writer.lock().unwrap();
+        let len = writer.get_ref().metadata()?.len();
         if len >= MAX_FILE_SIZE {
             self.use_next_gen()?;
-            self.compact(self.active_gen - 1)?;
+            self.compact(*self.active_gen.lock().unwrap() - 1)?;
         }
-        let pos = self.writer.stream_position()?;
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        let len = self.writer.stream_position()? - pos;
-        self.writer.flush()?;
+        let pos = writer.stream_position()?;
+        serde_json::to_writer(*writer, &cmd)?;
+        let len = writer.stream_position()? - pos;
+        writer.flush()?;
         Ok((pos, len))
     }
 
-    fn compact(&mut self, gen: u64) -> Result<()> {
-        let len = *self.dead_bytes.get(&gen).unwrap_or(&0);
-        if len <= COMPACTION_THRESHOLD || gen == self.active_gen {
+    fn compact(&self, gen: u64) -> Result<()> {
+        let mut dead_bytes = self.dead_bytes.lock().unwrap();
+        let active_gen = self.active_gen.lock().unwrap();
+        if gen == *active_gen || *dead_bytes.get(&gen).unwrap_or(&0) <= COMPACTION_THRESHOLD {
             return Ok(());
         }
-        self.dead_bytes.remove(&gen);
+        dead_bytes.remove(&gen);
 
-        let mut reader = self.readers.remove(&gen).unwrap();
-        reader.seek(SeekFrom::Start(0))?;
-        let mut stream = Deserializer::from_reader(reader).into_iter();
-        let mut file_size = self.writer.get_ref().metadata()?.len();
-        while let Some(cmd) = stream.next() {
-            let cmd = cmd?;
-            let end = stream.byte_offset() as u64;
-            match &cmd {
-                Command::Set { key, .. } => match self.keydir.get_mut(key) {
-                    Some(cmd_pos) => {
-                        if cmd_pos.gen != gen || cmd_pos.pos + cmd_pos.len != end {
-                            continue;
-                        }
-                        cmd_pos.gen = self.active_gen;
-                        cmd_pos.pos = self.writer.stream_position()?
-                    }
-                    None => continue,
-                },
-                Command::Remove { key, gen } => {
-                    if self.keydir.get(key).is_some()
-                        || *gen == self.active_gen
-                        || !get_log_path(&self.dir, *gen).exists()
-                    {
-                        continue;
-                    }
+        let reader = self.readers.borrow_mut().get_mut(&gen).unwrap();
+        let mut writer = *self.writer.lock().unwrap();
+        let mut pos = writer.stream_position()?;
+        for (key, old_pos) in self.keydir.into_iter() {
+            if old_pos.gen == gen {
+                reader.seek(SeekFrom::Start(old_pos.pos))?;
+                let mut reader = reader.take(old_pos.len);
+                io::copy(&mut reader, &mut writer)?;
+                self.keydir.insert(
+                    key,
+                    CommandPos {
+                        gen: *active_gen,
+                        pos,
+                        len: old_pos.len,
+                    },
+                );
+                pos += old_pos.len;
+                if pos > MAX_FILE_SIZE {
+                    self.use_next_gen()?;
+                    pos = 0;
                 }
             }
-            serde_json::to_writer(&mut self.writer, &cmd)?;
-            file_size += stream.byte_offset() as u64 - end;
-            if file_size >= MAX_FILE_SIZE {
-                self.use_next_gen()?;
-                file_size = 0;
-            }
         }
-        self.writer.flush()?;
+        writer.flush()?;
         fs::remove_file(get_log_path(&self.dir, gen))?;
-
         Ok(())
     }
 }
 
 impl KvsEngine for KvStore {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         let (pos, len) = self.write_command(Command::Set {
             key: key.clone(),
             value,
         })?;
-        let cmd_pos = CommandPos {
-            gen: self.active_gen,
-            pos,
-            len,
-        };
-        if let Some(old) = self.keydir.insert(key, cmd_pos) {
-            *self.dead_bytes.entry(old.gen).or_insert(0) += old.len;
+        let old = self.keydir.remove(&key);
+        self.keydir.insert(
+            key,
+            CommandPos {
+                gen: *self.active_gen.lock().unwrap(),
+                pos,
+                len,
+            },
+        );
+        if let Some(old) = old {
+            let old = old.value();
+            *self.dead_bytes.lock().unwrap().entry(old.gen).or_insert(0) += old.len;
             self.compact(old.gen)?;
         }
-
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         match self.keydir.get(&key) {
-            Some(&CommandPos { gen, pos, len }) => {
-                let reader = self.readers.get_mut(&gen).unwrap();
+            Some(entry) => {
+                let &CommandPos { gen, pos, len } = entry.value();
+                let mut reader = self.readers.borrow_mut().get_mut(&gen).unwrap();
                 reader.seek(SeekFrom::Start(pos))?;
                 let reader = reader.take(len);
                 match serde_json::from_reader(reader)? {
@@ -234,13 +247,16 @@ impl KvsEngine for KvStore {
         }
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         match self.keydir.remove(&key) {
             Some(old) => {
-                let (_, len) = self.write_command(Command::Remove { key, gen: old.gen })?;
-                *self.dead_bytes.entry(old.gen).or_insert(0) += old.len;
-                if old.gen == self.active_gen {
-                    *self.dead_bytes.entry(self.active_gen).or_insert(0) += len;
+                let old = old.value();
+                let (_, rm_len) = self.write_command(Command::Remove { key, gen: old.gen })?;
+                let dead_bytes = self.dead_bytes.lock().unwrap();
+                let active_gen = *self.active_gen.lock().unwrap();
+                *dead_bytes.entry(old.gen).or_insert(0) += old.len;
+                if old.gen == active_gen {
+                    *dead_bytes.entry(active_gen).or_insert(0) += rm_len;
                 }
                 self.compact(old.gen)?;
                 Ok(())
@@ -252,9 +268,9 @@ impl KvsEngine for KvStore {
 
 impl Drop for KvStore {
     fn drop(&mut self) {
-        let writer = BufWriter::new(File::create(self.dir.join("keydir.hint")).unwrap());
-        serde_json::to_writer(writer, &self.keydir).unwrap();
-        let writer = BufWriter::new(File::create(self.dir.join("dead_bytes.hint")).unwrap());
-        serde_json::to_writer(writer, &self.dead_bytes).unwrap();
+        // let writer = BufWriter::new(File::create(self.dir.join("keydir.hint")).unwrap());
+        // serde_json::to_writer(writer, &*self.keydir.lock().unwrap()).unwrap();
+        // let writer = BufWriter::new(File::create(self.dir.join("dead_bytes.hint")).unwrap());
+        // serde_json::to_writer(writer, &*self.dead_bytes.lock().unwrap()).unwrap();
     }
 }

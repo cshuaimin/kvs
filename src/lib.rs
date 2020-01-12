@@ -3,6 +3,7 @@
 mod client;
 mod engines;
 mod server;
+pub mod thread_pool;
 
 pub use client::KvsClient;
 pub use engines::{KvStore, KvsEngine, Sled};

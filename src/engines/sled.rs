@@ -10,14 +10,14 @@ impl Sled {
 }
 
 impl KvsEngine for Sled {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         Ok(self
             .0
             .insert(key, value.into_bytes())
             // .and_then(|_| self.0.flush())
             .map(|_| ())?)
     }
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         Ok(self
             .0
             .get(key)?
@@ -25,7 +25,7 @@ impl KvsEngine for Sled {
             .map(String::from_utf8)
             .transpose()?)
     }
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         match self.0.remove(key) {
             Ok(Some(_)) => Ok(self.0.flush().and_then(|_| Ok(()))?),
             Ok(None) => Err(KvsError::KeyNotFound),
