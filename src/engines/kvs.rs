@@ -1,156 +1,53 @@
 use crate::{KvsEngine, KvsError, Result};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeMap;
+use std::convert::TryInto;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossbeam_skiplist::SkipMap;
-use serde::{Deserialize, Serialize};
-use serde_json::Deserializer;
+use async_std::fs::{self, File, OpenOptions};
+use async_std::io::SeekFrom;
+use async_std::path::PathBuf;
+use async_std::prelude::*;
+use async_std::sync::RwLock;
+
+use dashmap::DashMap;
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024;
 const COMPACTION_THRESHOLD: u64 = (MAX_FILE_SIZE as f64 * 0.6) as u64;
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct KvStore {
-    reader: KvsReader,
-    writer: KvsWriter,
-}
-
-#[derive(Clone)]
-struct KvsReader {
-    dir: Arc<PathBuf>,
-    keydir: Arc<SkipMap<String, CommandPos>>,
-    readers: RefCell<BTreeMap<u64, BufReader<File>>>,
-}
-
-#[derive(Clone)]
-struct KvsWriter {
-    dir: Arc<PathBuf>,
-    keydir: Arc<SkipMap<String, CommandPos>>,
-    active_gen: Arc<Mutex<u64>>, // TODO: use atomics?
-    writer: Arc<Mutex<BufWriter<File>>>,
-    dead_bytes: Arc<Mutex<HashMap<u64, u64>>>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum Command {
-    Set { key: String, value: String },
-    Remove { key: String, gen: u64 },
+    dir: PathBuf,
+    keydir: DashMap<Vec<u8>, LogPos>,
+    rio: rio::Rio,
+    active_gen: u64,
+    readers: BTreeMap<u64, File>,
+    writer: RwLock<File>,
+    writer_pos: AtomicU64,
+    dead_bytes: DashMap<u64, u64>,
 }
 
 #[derive(Debug)]
-struct CommandPos {
+enum Log {
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Remove { key: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct LogPos {
     gen: u64,
     pos: u64,
     len: u64,
 }
 
-impl KvsReader {
-    fn get(&self, key: String) -> Result<Option<String>> {
-        match self.keydir.get(&key) {
-            Some(entry) => {
-                let &CommandPos { gen, pos, len } = entry.value();
-                let mut readers = self.readers.borrow_mut();
-                let reader = readers
-                    .entry(gen)
-                    .or_insert(BufReader::new(File::open(get_log_path(&self.dir, gen))?));
-                reader.seek(SeekFrom::Start(pos))?;
-                match serde_json::from_reader(reader.take(len))? {
-                    Command::Set { value, .. } => Ok(Some(value)),
-                    rm => panic!("Wrong remove command: {:?}", rm),
-                }
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-impl KvsWriter {
-    fn use_next_gen(&self) -> Result<()> {
-        let mut active_gen = self.active_gen.lock().unwrap();
-        *active_gen += 1;
-        let path = get_log_path(&self.dir, *active_gen);
-        *self.writer.lock().unwrap() = BufWriter::new(
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?,
-        );
-        Ok(())
-    }
-
-    fn write_command(&self, cmd: Command) -> Result<(u64, u64)> {
-        let mut writer = self.writer.lock().unwrap();
-        let len = writer.get_ref().metadata()?.len();
-        if len >= MAX_FILE_SIZE {
-            self.use_next_gen()?;
-            // self.compact(*self.active_gen.lock().unwrap() - 1)?;
-        }
-        let pos = writer.stream_position()?;
-        serde_json::to_writer(&mut *writer, &cmd)?;
-        let len = writer.stream_position()? - pos;
-        writer.flush()?;
-        Ok((pos, len))
-    }
-
-    fn set(&self, key: String, value: String) -> Result<()> {
-        let (pos, len) = self.write_command(Command::Set {
-            key: key.clone(),
-            value,
-        })?;
-        let old = self.keydir.remove(&key);
-        self.keydir.insert(
-            key,
-            CommandPos {
-                gen: *self.active_gen.lock().unwrap(),
-                pos,
-                len,
-            },
-        );
-        if let Some(old) = old {
-            let old = old.value();
-            *self.dead_bytes.lock().unwrap().entry(old.gen).or_insert(0) += old.len;
-            // self.compact(old.gen)?;
-        }
-        Ok(())
-    }
-
-    fn remove(&self, key: String) -> Result<()> {
-        match self.keydir.remove(&key) {
-            Some(old) => {
-                let old = old.value();
-                let (_, rm_len) = self.write_command(Command::Remove { key, gen: old.gen })?;
-                let mut dead_bytes = self.dead_bytes.lock().unwrap();
-                let active_gen = *self.active_gen.lock().unwrap();
-                *dead_bytes.entry(old.gen).or_insert(0) += old.len;
-                if old.gen == active_gen {
-                    *dead_bytes.entry(active_gen).or_insert(0) += rm_len;
-                }
-                // self.compact(old.gen)?;
-                Ok(())
-            }
-            None => Err(KvsError::KeyNotFound),
-        }
-    }
-}
-
-fn get_log_path(dir: &PathBuf, gen: u64) -> PathBuf {
-    dir.join(format!("{}.log", gen))
-}
-
 impl KvStore {
-    pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        let dir = Arc::new(dir.into());
-
+    pub async fn open(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
         let mut logs = Vec::new();
-        for entry in fs::read_dir(&*dir)? {
+        let entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next().await {
             let path = entry?.path();
-            if path.is_file() && path.extension() == Some("log".as_ref()) {
+            if path.is_file().await && path.extension() == Some("log".as_ref()) {
                 let gen: u64 = path.file_stem().unwrap().to_str().unwrap().parse()?;
                 logs.push(gen);
             }
@@ -163,44 +60,40 @@ impl KvStore {
         // Active file is used for both writing and reading.
         // Remember to flush the writer after writing to keep it in sync with the reader.
         let active_gen = *logs.last().unwrap();
-        let mut writer = BufWriter::new(
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(get_log_path(&dir, active_gen))?,
-        );
-        // For consistent behaviour, we explicitly seek to the end of file
+        let writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(get_log_path(&dir, active_gen))
+            .await?;
+        // for consistent behaviour, we explicitly seek to the end of file
         // (otherwise, it might be done only on the first write()).
-        // -- copied from cpython's Lib/_pyio.py
-        writer.seek(SeekFrom::End(0))?;
+        // -- copied from cpython's lib/_pyio.py
+        let writer_pos = AtomicU64::new(writer.seek(SeekFrom::End(0)).await?);
+        let writer = RwLock::new(writer);
 
         let mut readers = BTreeMap::new();
         for gen in logs {
-            readers.insert(gen, BufReader::new(File::open(get_log_path(&dir, gen))?));
+            readers.insert(gen, File::open(get_log_path(&dir, gen)).await?);
         }
-
-        let (keydir, dead_bytes) =
-            Self::read_hints(&dir).or_else(|_| Self::replay_logs(&mut readers))?;
-
-        let keydir = Arc::new(keydir);
+        let rio = rio::new().expect("error creating rio");
+        let (keydir, dead_bytes) = match Self::read_hints(&dir).await {
+            Ok(r) => r,
+            Err(_) => Self::replay_logs(&rio, &mut readers).await?,
+        };
 
         Ok(KvStore {
-            reader: KvsReader {
-                dir: Arc::clone(&dir),
-                keydir: Arc::clone(&keydir),
-                readers: RefCell::new(readers),
-            },
-            writer: KvsWriter {
-                dir: Arc::clone(&dir),
-                keydir: Arc::clone(&keydir),
-                active_gen: Arc::new(Mutex::new(active_gen)),
-                writer: Arc::new(Mutex::new(writer)),
-                dead_bytes: Arc::new(Mutex::new(dead_bytes)),
-            },
+            dir,
+            keydir,
+            rio,
+            active_gen,
+            readers,
+            writer,
+            writer_pos,
+            dead_bytes,
         })
     }
 
-    fn read_hints(dir: &PathBuf) -> Result<(SkipMap<String, CommandPos>, HashMap<u64, u64>)> {
+    async fn read_hints(dir: &PathBuf) -> Result<(DashMap<Vec<u8>, LogPos>, DashMap<u64, u64>)> {
         // let reader = BufReader::new(File::open(dir.join("keydir.hint"))?);
         // let keydir = serde_json::from_reader(reader)?;
         // let reader = BufReader::new(File::open(dir.join("dead_bytes.hint"))?);
@@ -209,49 +102,144 @@ impl KvStore {
         Err(KvsError::KeyNotFound) // TODO: SkipMap is not serializable
     }
 
-    fn replay_logs(
-        readers: &mut BTreeMap<u64, BufReader<File>>,
-    ) -> Result<(SkipMap<String, CommandPos>, HashMap<u64, u64>)> {
-        let keydir = SkipMap::<String, CommandPos>::new();
-        let mut dead_bytes = HashMap::new();
-        for (&gen, reader) in readers.iter_mut() {
+    async fn replay_logs(
+        rio: &rio::Rio,
+        readers: &mut BTreeMap<u64, File>,
+    ) -> Result<(DashMap<Vec<u8>, LogPos>, DashMap<u64, u64>)> {
+        let keydir = DashMap::<Vec<u8>, LogPos>::new();
+        let mut dead_bytes = DashMap::with_capacity(readers.len());
+
+        for (&gen, file) in readers.iter_mut() {
             let mut pos = 0;
-            let mut stream = Deserializer::from_reader(reader).into_iter();
-            while let Some(cmd) = stream.next() {
-                let new_pos = stream.byte_offset() as u64;
-                let len = new_pos - pos;
-                match cmd? {
-                    Command::Set { key, .. } => {
-                        if let Some(old) = keydir.get(&key) {
-                            *dead_bytes.entry(old.value().gen).or_insert(0) += old.value().len;
-                        }
-                        keydir.insert(key, CommandPos { gen, pos, len });
+            let (log, len) = Log::read(rio, file, pos).await?;
+            match log {
+                Log::Set { key, value } => {
+                    if let Some(old) = keydir.get(&key) {
+                        *dead_bytes.entry(old.value().gen).or_insert(0) += old.value().len;
                     }
-                    Command::Remove { key, .. } => match keydir.remove(&key) {
-                        Some(old) => {
-                            *dead_bytes.entry(old.value().gen).or_insert(0) += old.value().len
-                        }
-                        None => *dead_bytes.entry(gen).or_insert(0) += len,
-                    },
+                    keydir.insert(key, LogPos { gen, pos, len });
                 }
-                pos = new_pos;
+                Log::Remove { key } => match keydir.remove(&key) {
+                    Some((_, old_value)) => {
+                        *dead_bytes.entry(old_value.gen).or_insert(0) += old_value.len
+                    }
+                    None => panic!(), // *dead_bytes.entry(gen).or_insert(0) += len,
+                },
             }
+            pos += len;
         }
         Ok((keydir, dead_bytes))
     }
-}
 
-impl KvsEngine for KvStore {
-    fn get(&self, key: String) -> Result<Option<String>> {
-        self.reader.get(key)
+    async fn use_next_gen(&mut self) -> Result<()> {
+        let guard = self.writer.write().await;
+        self.active_gen += 1;
+        let path = get_log_path(&self.dir, self.active_gen);
+        *guard = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        self.writer_pos.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
-    fn set(&self, key: String, value: String) -> Result<()> {
-        self.writer.set(key, value)
+    async fn write_log(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<LogPos> {
+        if self.writer_pos.load(Ordering::SeqCst) >= MAX_FILE_SIZE {
+            self.use_next_gen().await?;
+        }
+
+        let len = (1                    // set or remove?
+            + mem::size_of::<u64>()     // key size
+            + key.len()                 // key
+            + if value.is_some() {
+                mem::size_of::<u64>()   // value size
+                + value.unwrap().len()  // value
+            } else {
+                0
+            }) as u64;
+        let pos = self.writer_pos.fetch_add(len, Ordering::SeqCst);
+
+        let mut start = pos;
+        let writer = self.writer.read().await;
+        macro_rules! write {
+            ($data:expr) => {{
+                let data = $data;
+                let result = self.rio.write_at(&*writer, data, start);
+                start += data.len() as u64;
+                result
+            };};
+        }
+
+        match value {
+            Some(value) => {
+                write!(&[1u8])?.await;
+                write!(&key.len().to_be_bytes())?.await;
+                write!(&value.len().to_be_bytes())?.await;
+                write!(key)?.await;
+                write!(value)?.await;
+            }
+            None => {
+                write!(&[0u8])?.await;
+                write!(key.len().to_be_bytes())?.await;
+                write!(key)?.await;
+            }
+        }
+        Ok(LogPos {
+            gen: self.active_gen,
+            pos,
+            len,
+        })
     }
 
-    fn remove(&self, key: String) -> Result<()> {
-        self.writer.remove(key)
+    async fn get<K>(&mut self, key: K) -> Result<Option<Vec<u8>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        match self.keydir.get(key.as_ref()) {
+            Some(entry) => {
+                let LogPos { gen, pos, .. } = entry.value();
+                let file = self.readers.get(gen).unwrap();
+                let (log, _) = Log::read(&self.rio, file, *pos).await?;
+                match log {
+                    Log::Set { value, .. } => Ok(Some(value)),
+                    rm => panic!(format!("wrong remove log: {:?}", rm)),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn set<K, V>(&mut self, key: K, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let key = key.as_ref().to_vec();
+        let value = value.as_ref();
+        let log_pos = self.write_log(&key, Some(value)).await?;
+        if let Some(old) = self.keydir.insert(key, log_pos) {
+            *self.dead_bytes.entry(old.gen).or_insert(0) += old.len;
+        }
+        Ok(())
+    }
+
+    async fn remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let key = key.as_ref();
+        match self.keydir.remove(key) {
+            Some((_, old)) => {
+                let rm = self.write_log(key, None).await?;
+                *self.dead_bytes.entry(old.gen).or_insert(0) += old.len;
+                if old.gen != rm.gen {
+                    *self.dead_bytes.entry(rm.gen).or_insert(0) += rm.len;
+                }
+                Ok(())
+            }
+            None => Err(KvsError::KeyNotFound),
+        }
     }
 }
 
@@ -262,4 +250,45 @@ impl Drop for KvStore {
         // let writer = BufWriter::new(File::create(self.dir.join("dead_bytes.hint")).unwrap());
         // serde_json::to_writer(writer, &*self.dead_bytes.lock().unwrap()).unwrap();
     }
+}
+
+impl Log {
+    async fn read(rio: &rio::Rio, file: &File, pos: u64) -> Result<(Log, u64)> {
+        let buffer = vec![0u8; 1 + mem::size_of::<usize>() * 2];
+        let read = rio.read_at(file, &buffer, pos)?.await?;
+        match buffer[0] {
+            0 => {
+                let (key_len_bytes, value_len_bytes) =
+                    buffer[1..].split_at(mem::size_of::<usize>());
+                let key_len = usize::from_be_bytes(key_len_bytes.try_into().unwrap());
+                let value_len = usize::from_be_bytes(value_len_bytes.try_into().unwrap());
+                let key = vec![0u8; key_len];
+                let value = vec![0u8; value_len];
+                rio.read_at(file, &key, pos + 1 + mem::size_of::<usize>() as u64)?
+                    .await;
+                rio.read_at(file, &value, pos + 1 + mem::size_of::<usize>() as u64 * 2)?
+                    .await;
+                Ok((
+                    Log::Set { key, value },
+                    (1 + mem::size_of::<usize>() * 2 + key_len + value_len) as u64,
+                ))
+            }
+            1 => {
+                let key_len_bytes = &buffer[1..mem::size_of::<usize>()];
+                let key_len = usize::from_be_bytes(key_len_bytes.try_into().unwrap());
+                let key = vec![0u8; key_len];
+                rio.read_at(file, &key, pos + 1 + mem::size_of::<usize>() as u64)?
+                    .await;
+                Ok((
+                    Log::Remove { key },
+                    (1 + mem::size_of::<usize>() + key_len) as u64,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+}
+
+fn get_log_path(dir: &PathBuf, gen: u64) -> PathBuf {
+    dir.join(format!("{}.log", gen))
 }

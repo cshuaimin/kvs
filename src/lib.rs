@@ -11,8 +11,8 @@ pub use server::start_server;
 
 use failure::Fail;
 use serde::{Deserialize, Serialize};
-use std::{io, num::ParseIntError};
 use std::string::FromUtf8Error;
+use std::{io, num::ParseIntError};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
