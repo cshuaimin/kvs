@@ -7,7 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-std = "1.4.0"
+async-std = { version = "1.4.0", features = ["unstable"] }
 rio = "0.8.0"
 dashmap = { version = "3.2.2", features = ["serde"] }
 bincode = "1.2.1"

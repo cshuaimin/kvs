@@ -140,7 +140,7 @@ fn concurrent_set() -> Result<()> {
     task::block_on(async {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
         let store = Arc::new(KvStore::open(temp_dir.path()).await?);
-        const N: usize = 10;
+        const N: usize = 1000;
         let mut tasks = Vec::with_capacity(N);
         for i in 0..N {
             let store = Arc::clone(&store);
