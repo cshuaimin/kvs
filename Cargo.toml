@@ -7,27 +7,23 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = "2.33.0"
-structopt = "0.3.3"
-failure = "0.1.6"
-serde = { version = "1.0.101", features = ["derive"] }
-serde_json = "1.0.41"
-log = "0.4.8"
-env_logger = "0.7.0"
-sled = "0.30.0"
-crossbeam-skiplist = { version = "0.0.0", git = "https://github.com/crossbeam-rs/crossbeam.git" }
-crossbeam-channel = "0.4.0"
-rio = "0.7.5"
 async-std = "1.4.0"
-dashmap = "3.2.1"
+rio = "0.8.0"
+dashmap = { version = "3.2.2", features = ["serde"] }
+bincode = "1.2.1"
+failure = "0.1.6"
+structopt = "0.3.8"
+log = "0.4.8"
+env_logger = "0.7.1"
+serde = "1.0.104"
 
 [dev-dependencies]
-assert_cmd = "0.11.1"
-predicates = "1.0.1"
+assert_cmd = "0.12.0"
+predicates = "1.0.2"
 tempfile = "3.1.0"
-walkdir = "2.2.9"
+walkdir = "2.3.1"
 criterion = "0.3.0"
-rand = "0.7.2"
+rand = "0.7.3"
 crossbeam-utils = "0.7.0"
 panic-control = "0.1.4"
 

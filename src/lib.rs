@@ -1,25 +1,21 @@
-#![feature(seek_convenience)]
-
 mod client;
-mod engines;
+mod kvs;
 mod server;
-pub mod thread_pool;
 
-pub use client::KvsClient;
-pub use engines::{KvStore, KvsEngine, Sled};
-pub use server::start_server;
+// pub use client::KvsClient;
+pub use self::kvs::KvStore;
+// pub use server::start_server;
 
 use failure::Fail;
-use serde::{Deserialize, Serialize};
 use std::string::FromUtf8Error;
 use std::{io, num::ParseIntError};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Request {
-    Set { key: String, value: String },
-    Get { key: String },
-    Remove { key: String },
-}
+// // #[derive(Serialize, Deserialize, Debug)]
+// pub enum Request {
+//     Set { key: String, value: String },
+//     Get { key: String },
+//     Remove { key: String },
+// }
 
 #[derive(Fail, Debug)]
 pub enum KvsError {
@@ -29,11 +25,11 @@ pub enum KvsError {
     #[fail(display = "{}", _0)]
     Parse(#[fail(cause)] ParseIntError),
 
-    #[fail(display = "{}", _0)]
-    Serde(#[fail(cause)] serde_json::Error),
+    // #[fail(display = "{}", _0)]
+    // Serde(#[fail(cause)] serde_json::Error),
 
-    #[fail(display = "sled error: {}", _0)]
-    Sled(#[fail(cause)] sled::Error),
+    // #[fail(display = "sled error: {}", _0)]
+    // Sled(#[fail(cause)] sled::Error),
 
     #[fail(display = "UTF-8 error: {}", _0)]
     Utf8(#[fail(cause)] FromUtf8Error),
@@ -57,17 +53,17 @@ impl From<ParseIntError> for KvsError {
     }
 }
 
-impl From<serde_json::Error> for KvsError {
-    fn from(err: serde_json::Error) -> KvsError {
-        KvsError::Serde(err)
-    }
-}
+// impl From<serde_json::Error> for KvsError {
+//     fn from(err: serde_json::Error) -> KvsError {
+//         KvsError::Serde(err)
+//     }
+// }
 
-impl From<sled::Error> for KvsError {
-    fn from(err: sled::Error) -> KvsError {
-        KvsError::Sled(err)
-    }
-}
+// impl From<sled::Error> for KvsError {
+//     fn from(err: sled::Error) -> KvsError {
+//         KvsError::Sled(err)
+//     }
+// }
 
 impl From<FromUtf8Error> for KvsError {
     fn from(err: FromUtf8Error) -> KvsError {
