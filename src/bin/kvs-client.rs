@@ -25,11 +25,11 @@
 // }
 
 fn main() {
-//     let opt = Opt::from_args();
-//     if let Err(e) = run(opt) {
-//         eprintln!("Error: {}", e);
-//         std::process::exit(1);
-//     }
+    //     let opt = Opt::from_args();
+    //     if let Err(e) = run(opt) {
+    //         eprintln!("Error: {}", e);
+    //         std::process::exit(1);
+    //     }
 }
 
 // fn run(opt: Opt) -> Result<()> {

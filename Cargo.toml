@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 async-std = { version = "1.4.0", features = ["unstable"] }
 rio = "0.8.0"
-dashmap = { version = "3.2.2", features = ["serde"] }
+crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam" }
 bincode = "1.2.1"
 failure = "0.1.6"
 structopt = "0.3.8"

@@ -1,7 +1,9 @@
 mod client;
 mod kvs;
 mod server;
+mod skipmap;
 
+use skipmap::SkipMap;
 // pub use client::KvsClient;
 pub use self::kvs::KvStore;
 // pub use server::start_server;
@@ -30,7 +32,6 @@ pub enum KvsError {
 
     // #[fail(display = "sled error: {}", _0)]
     // Sled(#[fail(cause)] sled::Error),
-
     #[fail(display = "UTF-8 error: {}", _0)]
     Utf8(#[fail(cause)] FromUtf8Error),
 

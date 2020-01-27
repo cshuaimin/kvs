@@ -1,7 +1,6 @@
-use async_std::sync::Arc;
 use async_std::task;
 use tempfile::TempDir;
-// use walkdir::WalkDir;
+use walkdir::WalkDir;
 
 use kvs::{KvStore, Result};
 
@@ -91,59 +90,63 @@ fn remove_key() -> Result<()> {
 
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
-// #[test]
-// fn compaction() -> Result<()> {
-//     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-//     let store = KvStore::open(temp_dir.path()).await?;
+#[test]
+fn compaction() -> Result<()> {
+    task::block_on(async {
+        // let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+        let store = KvStore::open("/dev/shm").await?;
 
-//     let dir_size = || {
-//         let entries = WalkDir::new(temp_dir.path()).into_iter();
-//         let len: walkdir::Result<u64> = entries
-//             .map(|res| {
-//                 res.and_then(|entry| entry.metadata())
-//                     .map(|metadata| metadata.len())
-//             })
-//             .sum();
-//         len.expect("fail to get directory size")
-//     };
+        let dir_size = || {
+            let entries = WalkDir::new("/dev/shm").into_iter();
+            let len: walkdir::Result<u64> = entries
+                .map(|res| {
+                    res.and_then(|entry| entry.metadata())
+                        .map(|metadata| metadata.len())
+                })
+                .sum();
+            len.expect("fail to get directory size")
+        };
 
-//     let mut current_size = dir_size();
-//     for iter in 0..1000 {
-//         for key_id in 0..1000 {
-//             let key = format!("key{}", key_id);
-//             let value = format!("{}", iter);
-//             store.set(key, value)?;
-//         }
+        let mut current_size = dir_size();
+        for iter in 0..1000 {
+            for key_id in 0..1000 {
+                let key = format!("key{}", key_id);
+                let value = format!("{}", iter);
+                store.set(key, value).await?;
+            }
 
-//         let new_size = dir_size();
-//         if new_size > current_size {
-//             current_size = new_size;
-//             continue;
-//         }
-//         // Compaction triggered
+            let new_size = dir_size();
+            if new_size > current_size {
+                current_size = new_size;
+                continue;
+            }
+            // Compaction triggered
 
-//         drop(store);
-//         // reopen and check content
-//         let store = KvStore::open(temp_dir.path()).await?;
-//         for key_id in 0..1000 {
-//             let key = format!("key{}", key_id);
-//             assert_eq!(store.get(key)?, Some(format!("{}", iter)));
-//         }
-//         return Ok(());
-//     }
-
-//     panic!("No compaction detected");
-// }
+            drop(store);
+            // reopen and check content
+            let store = KvStore::open("/dev/shm").await?;
+            for key_id in 0..1000 {
+                let key = format!("key{}", key_id);
+                assert_eq!(
+                    store.get(key).await?,
+                    Some(format!("{}", iter).into_bytes())
+                );
+            }
+            return Ok(());
+        }
+        panic!("No compaction detected");
+    })
+}
 
 #[test]
 fn concurrent_set() -> Result<()> {
     task::block_on(async {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let store = Arc::new(KvStore::open(temp_dir.path()).await?);
-        const N: usize = 1000;
+        let store = KvStore::open(temp_dir.path()).await?;
+        const N: usize = 100;
         let mut tasks = Vec::with_capacity(N);
         for i in 0..N {
-            let store = Arc::clone(&store);
+            let store = store.clone();
             tasks.push(task::spawn(async move {
                 store.set(format!("key{}", i), format!("value{}", i)).await
             }));
@@ -176,7 +179,7 @@ fn concurrent_set() -> Result<()> {
 fn concurrent_get() -> Result<()> {
     task::block_on(async {
         let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let store = Arc::new(KvStore::open(temp_dir.path()).await?);
+        let store = KvStore::open(temp_dir.path()).await?;
         for i in 0..100 {
             store
                 .set(format!("key{}", i), format!("value{}", i))
@@ -185,7 +188,7 @@ fn concurrent_get() -> Result<()> {
 
         let mut tasks = Vec::with_capacity(100);
         for id in 0..100 {
-            let store = Arc::clone(&store);
+            let store = store.clone();
             tasks.push(task::spawn(async move {
                 for i in 0..100 {
                     let key_id = (i + id) % 100;
@@ -202,10 +205,10 @@ fn concurrent_get() -> Result<()> {
 
         // Open from disk again and check persistent data
         drop(store);
-        let store = Arc::new(KvStore::open(temp_dir.path()).await?);
+        let store = KvStore::open(temp_dir.path()).await?;
         let mut tasks = Vec::with_capacity(100);
         for id in 0..100 {
-            let store = Arc::clone(&store);
+            let store = store.clone();
             tasks.push(task::spawn(async move {
                 for i in 0..100 {
                     let key_id = (i + id) % 100;
