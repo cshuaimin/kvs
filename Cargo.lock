@@ -1000,9 +1000,9 @@ dependencies = [
 
 [[package]]
 name = "rio"
-version = "0.8.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2aa1139a57034957c635e43127a46578125a36443c864b1e9b16c19c000d0ac4"
+checksum = "ba776904ad2a875aea06104ce0806289e6937a26d6257061685b25254abbff45"
 dependencies = [
  "libc",
 ]

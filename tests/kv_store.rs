@@ -93,11 +93,11 @@ fn remove_key() -> Result<()> {
 #[test]
 fn compaction() -> Result<()> {
     task::block_on(async {
-        // let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-        let store = KvStore::open("/dev/shm").await?;
+        let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+        let store = KvStore::open(temp_dir.path()).await?;
 
         let dir_size = || {
-            let entries = WalkDir::new("/dev/shm").into_iter();
+            let entries = WalkDir::new(temp_dir.path()).into_iter();
             let len: walkdir::Result<u64> = entries
                 .map(|res| {
                     res.and_then(|entry| entry.metadata())
@@ -124,7 +124,7 @@ fn compaction() -> Result<()> {
 
             drop(store);
             // reopen and check content
-            let store = KvStore::open("/dev/shm").await?;
+            let store = KvStore::open(temp_dir.path()).await?;
             for key_id in 0..1000 {
                 let key = format!("key{}", key_id);
                 assert_eq!(
