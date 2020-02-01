@@ -1,44 +1,34 @@
-// use super::{KvsError, Request, Result};
-// use std::{
-//     io::{prelude::*, BufReader, BufWriter},
-//     net::{TcpStream, ToSocketAddrs},
-// };
+use async_std::net::{TcpStream, ToSocketAddrs};
 
-// type Response = std::result::Result<Option<String>, String>;
+use super::{receive, send, Request, Result};
 
-// pub struct KvsClient/*<'de>*/ {
-//     // responses: StreamDeserializer<'de, IoRead<BufReader<TcpStream>>, Response>,
-//     writer: BufWriter<TcpStream>,
-// }
+type Response = std::result::Result<Option<String>, String>;
 
-// impl<'de> KvsClient<'de> {
-//     pub fn new(addr: impl ToSocketAddrs) -> Result<Self> {
-//         let stream = TcpStream::connect(addr)?;
-//         let writer = BufWriter::new(stream.try_clone()?);
-//         let responses = Deserializer::from_reader(BufReader::new(stream)).into_iter();
-//         Ok(KvsClient { responses, writer })
-//     }
+pub struct KvsClient {
+    stream: TcpStream,
+}
 
-//     fn send_request(&mut self, request: Request) -> Result<Option<String>> {
-//         serde_json::to_writer(&mut self.writer, &request)?;
-//         self.writer.flush()?;
-//         match self.responses.next() {
-//             None => Err(KvsError::StringError(
-//                 "lost connection to server".to_string(),
-//             )),
-//             Some(response) => response?.map_err(KvsError::StringError),
-//         }
-//     }
+impl KvsClient {
+    pub async fn new(addr: impl ToSocketAddrs) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        Ok(KvsClient { stream })
+    }
 
-//     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-//         self.send_request(Request::Set { key, value }).map(|_| ())
-//     }
+    pub async fn set(&mut self, key: String, value: String) -> Result<()> {
+        send(&mut self.stream, &Request::Set { key, value }).await?;
+        let resp: Response = bincode::deserialize(&receive(&mut self.stream).await?).unwrap();
+        resp.map(|_| ()).map_err(|s| s.into())
+    }
 
-//     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-//         self.send_request(Request::Get { key })
-//     }
+    pub async fn get(&mut self, key: String) -> Result<Option<String>> {
+        send(&mut self.stream, &Request::Get { key }).await?;
+        let resp: Response = bincode::deserialize(&receive(&mut self.stream).await?).unwrap();
+        resp.map_err(|s| s.into())
+    }
 
-//     pub fn remove(&mut self, key: String) -> Result<()> {
-//         self.send_request(Request::Remove { key }).map(|_| ())
-//     }
-// }
+    pub async fn remove(&mut self, key: String) -> Result<()> {
+        send(&mut self.stream, &Request::Remove { key }).await?;
+        let resp: Response = bincode::deserialize(&receive(&mut self.stream).await?).unwrap();
+        resp.map(|_| ()).map_err(|s| s.into())
+    }
+}

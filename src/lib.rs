@@ -3,21 +3,40 @@ mod kvs;
 mod server;
 mod skipmap;
 
-use skipmap::SkipMap;
-// pub use client::KvsClient;
 pub use self::kvs::KvStore;
-// pub use server::start_server;
+pub use client::KvsClient;
+pub use server::start_server;
+use skipmap::SkipMap;
 
+use async_std::net::TcpStream;
+use async_std::prelude::*;
 use failure::Fail;
+use serde::{Deserialize, Serialize};
 use std::string::FromUtf8Error;
 use std::{io, num::ParseIntError};
 
-// // #[derive(Serialize, Deserialize, Debug)]
-// pub enum Request {
-//     Set { key: String, value: String },
-//     Get { key: String },
-//     Remove { key: String },
-// }
+#[derive(Serialize, Deserialize, Debug)]
+enum Request {
+    Set { key: String, value: String },
+    Get { key: String },
+    Remove { key: String },
+}
+
+async fn send<T: Serialize>(stream: &mut TcpStream, data: &T) -> Result<()> {
+    let data = bincode::serialize(data).unwrap();
+    stream.write_all(&data.len().to_be_bytes()).await?;
+    stream.write_all(&data).await?;
+    Ok(())
+}
+
+async fn receive(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 8];
+    stream.read_exact(&mut len).await?;
+    let len = usize::from_be_bytes(len);
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
 
 #[derive(Fail, Debug)]
 pub enum KvsError {

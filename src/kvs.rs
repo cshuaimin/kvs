@@ -49,32 +49,27 @@ struct LogPos {
 impl KvStore {
     pub async fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = Arc::new(dir.into());
-        let mut logs = Vec::new();
+        let mut active_gen = 0;
+        let readers = Arc::new(SkipMap::new());
         let mut files = fs::read_dir(&*dir).await?;
         while let Some(file) = files.next().await {
             let path = file?.path();
             if path.is_file().await && path.extension() == Some("log".as_ref()) {
                 let gen: u64 = path.file_stem().unwrap().to_str().unwrap().parse()?;
-                logs.push(gen);
+                active_gen = active_gen.max(gen);
+                readers.insert(gen, File::open(path).await?);
             }
         }
-        logs.sort_unstable();
-        if logs.is_empty() {
-            logs.push(0);
-        }
-
-        let active_gen = *logs.last().unwrap();
         let mut writer = OpenOptions::new()
             .create(true)
             .write(true)
             .open(get_log_path(&dir, active_gen))
             .await?;
         let writer_pos = writer.seek(SeekFrom::End(0)).await?;
-
-        let readers = Arc::new(SkipMap::new());
-        for gen in logs {
-            readers.insert(gen, File::open(get_log_path(&dir, gen)).await?);
+        if readers.is_empty() {
+            readers.insert(0, File::open(get_log_path(&dir, 0)).await?);
         }
+
         let rio = rio::new()?;
         let (keydir, dead_bytes) = match File::open(get_keydir_path(&dir)).await {
             Ok(file) => {
@@ -138,12 +133,12 @@ impl KvStore {
     }
 
     async fn compact(&self, gen: u64, writer: &mut KvsWriter) -> Result<()> {
-        writer.dead_bytes.remove(&gen);
         for entry in self.reader.keydir.iter().filter(|x| x.value().gen == gen) {
             let key = entry.key();
             let value = self.reader.get(key).await?.unwrap();
             writer.set(key, &value).await?;
         }
+        writer.dead_bytes.remove(&gen);
         writer.readers.remove(&gen);
         fs::remove_file(get_log_path(&writer.dir, gen)).await?;
         Ok(())
