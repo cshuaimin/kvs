@@ -11,7 +11,7 @@ async-std = { version = "1.4.0", features = ["unstable"] }
 rio = "0.9.1"
 crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam" }
 bincode = "1.2.1"
-failure = "0.1.6"
+thiserror = "1.0.10"
 structopt = "0.3.8"
 log = "0.4.8"
 env_logger = "0.7.1"

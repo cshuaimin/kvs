@@ -6,7 +6,7 @@ use async_std::prelude::*;
 use async_std::task;
 use log::warn;
 
-use super::{receive, send, KvStore, Request, Result};
+use super::{receive, send, KvStore, KvsError, Request, Result};
 
 pub async fn start_server(addr: impl ToSocketAddrs) -> Result<()> {
     let kvs = KvStore::open(current_dir()?).await?;
@@ -28,13 +28,13 @@ pub async fn start_server(addr: impl ToSocketAddrs) -> Result<()> {
 async fn serve(stream: &mut TcpStream, kvs: KvStore) -> Result<()> {
     loop {
         let response = match receive(stream).await {
-            Ok(buf) => match bincode::deserialize(&buf).unwrap() {
+            Ok(buf) => match bincode::deserialize(&buf)? {
                 Request::Get { key } => kvs.get(key).await,
                 Request::Set { key, value } => kvs.set(key, value).await.map(|()| None),
                 Request::Remove { key } => kvs.remove(key).await.map(|()| None),
             },
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(KvsError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
         }
         .map_err(|e| e.to_string());
         send(stream, &response).await?;

@@ -55,7 +55,7 @@ impl KvStore {
         while let Some(file) = files.next().await {
             let path = file?.path();
             if path.is_file().await && path.extension() == Some("log".as_ref()) {
-                let gen: u64 = path.file_stem().unwrap().to_str().unwrap().parse()?;
+                let gen: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
                 active_gen = active_gen.max(gen);
                 readers.insert(gen, File::open(path).await?);
             }
@@ -75,7 +75,7 @@ impl KvStore {
             Ok(file) => {
                 let buffer = vec![0u8; file.metadata().await?.len() as usize];
                 rio.read_at(&file, &buffer, 0).await?;
-                bincode::deserialize(&buffer).unwrap()
+                bincode::deserialize(&buffer)?
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Default::default(),
             Err(e) => return Err(e.into()),
@@ -216,7 +216,7 @@ impl Drop for KvsWriter {
     fn drop(&mut self) {
         let _ = task::block_on(async {
             let file = File::create(get_keydir_path(&self.dir)).await?;
-            let data = bincode::serialize(&(&*self.keydir, &self.dead_bytes)).unwrap();
+            let data = bincode::serialize(&(&*self.keydir, &self.dead_bytes))?;
             self.rio.write_at(&file, &data, 0).await?;
             Result::<()>::Ok(())
         });
