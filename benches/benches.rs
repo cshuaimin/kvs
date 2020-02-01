@@ -1,63 +1,35 @@
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use kvs::{KvStore, KvsEngine, Sled};
-use rand::prelude::*;
+use async_std::task;
+use criterion::{criterion_group, criterion_main, Criterion};
+use kvs::KvStore;
 use tempfile::TempDir;
 
-pub fn benchmark(c: &mut Criterion) {
-    let mut rng = thread_rng();
-
-    macro_rules! get_key {
-        () => {
-            format!("key{}", rng.gen_range(0, 100))
-        };
-    }
-
-    macro_rules! get_value {
-        () => {
-            "v".repeat(rng.gen_range(1, 100000))
-        };
-    }
-
-    macro_rules! bench_write {
-        ($engine:ident, $group:expr) => {
-            let temp_dir = TempDir::new().unwrap();
-            let mut store = $engine::open(temp_dir.path()).unwrap();
-            $group.bench_function(BenchmarkId::new(stringify!($engine), ""), |b| {
-                b.iter_batched(
-                    || (get_key!(), get_value!()),
-                    |(key, value)| store.set(key, value).unwrap(),
-                    BatchSize::SmallInput,
-                )
-            });
-        };
-    }
-
-    macro_rules! bench_read {
-        ($engine:ident, $group:expr) => {
-            let temp_dir = TempDir::new().unwrap();
-            let mut store = $engine::open(temp_dir.path()).unwrap();
-            (0..100).for_each(|_| {
-                store.set(get_key!(), get_value!()).unwrap();
-            });
-            $group.bench_function(BenchmarkId::new(stringify!($engine), ""), |b| {
-                b.iter_batched(
-                    || get_key!(),
-                    |key| store.get(key).unwrap(),
-                    BatchSize::SmallInput,
-                )
-            });
-        };
-    }
-
-    let mut write_group = c.benchmark_group("write");
-    bench_write!(KvStore, write_group);
-    bench_write!(Sled, write_group);
-    write_group.finish();
-    let mut read_group = c.benchmark_group("read");
-    bench_read!(KvStore, read_group);
-    bench_read!(Sled, read_group);
-    read_group.finish();
+pub fn get(c: &mut Criterion) {
+    let temp_dir = TempDir::new().unwrap();
+    let store = task::block_on(async {
+        let store = KvStore::open(temp_dir.path()).await.unwrap();
+        store.set("key", "value").await.unwrap();
+        store
+    });
+    c.bench_function("kvs", |b| {
+        b.iter(|| {
+            task::block_on(async {
+                store.get("key").await.unwrap();
+            })
+        });
+    });
 }
 
-criterion_group!(benches, benchmark);
+pub fn set(c: &mut Criterion) {
+    let temp_dir = TempDir::new().unwrap();
+    let store = task::block_on(KvStore::open(temp_dir.path())).unwrap();
+    c.bench_function("kvs", |b| {
+        b.iter(|| {
+            task::block_on(async {
+                store.set("key", "value").await.unwrap();
+            })
+        });
+    });
+}
+
+criterion_group!(benches, get, set);
 criterion_main!(benches);

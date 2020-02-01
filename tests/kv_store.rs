@@ -1,6 +1,7 @@
+use std::fs;
+
 use async_std::task;
 use tempfile::TempDir;
-use walkdir::WalkDir;
 
 use kvs::{KvStore, Result};
 
@@ -97,14 +98,10 @@ fn compaction() -> Result<()> {
         let store = KvStore::open(temp_dir.path()).await?;
 
         let dir_size = || {
-            let entries = WalkDir::new(temp_dir.path()).into_iter();
-            let len: walkdir::Result<u64> = entries
-                .map(|res| {
-                    res.and_then(|entry| entry.metadata())
-                        .map(|metadata| metadata.len())
-                })
-                .sum();
-            len.expect("fail to get directory size")
+            fs::read_dir(temp_dir.path())
+                .unwrap()
+                .map(|file| file.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
         };
 
         let mut current_size = dir_size();
